@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""找微信窗口 + Windows Graphics Capture 盯着它 + 从帧里定位消息区。帧全程内存，绝不落盘。"""
+"""找聊天窗口 + Windows Graphics Capture 盯着它 + 从帧里定位消息区。帧全程内存，绝不落盘。"""
 import ctypes
 import os
 import time
@@ -10,8 +10,8 @@ u32 = ctypes.windll.user32
 
 
 def find_wechat_hwnd():
-    """枚举可见顶层窗口，进程是 Weixin.exe/WeChat.exe 的里挑标题「微信」的（主窗口），没有就取第一个。
-    同进程还有 'Weixin'（工具窗）、'图片和视频'（看图窗）等，面积可能更大，所以不能按面积挑。"""
+    """枚举可见顶层窗口，按进程名挑主窗口，没有就取第一个。
+    同进程还有工具窗和看图窗，面积可能更大，所以不能按面积挑。"""
     k32 = ctypes.windll.kernel32
     found = []
 
