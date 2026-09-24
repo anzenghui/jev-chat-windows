@@ -469,8 +469,8 @@ Copyright © 2026 rezoch340 与 jev-chat 贡献者。代码以 [MIT](LICENSE) �
 - 本项目是 [Jev 聊天助手](https://github.com/jev-chat/jev-chat-jarvis)（安卓原版）的 Windows
   姊妹项目，Jev 判断内核与题目口径来自上游，版权归 Finderchangchang 与 jev-chat 贡献者所有。
 - **分发或商用时须保留 LICENSE 与 NOTICE**，并在产品「关于」页、说明文档或发布页写明来源。推荐写法：
-  `基于 jev-chat-windows（https://github.com/jev-chat/jev-chat-windows）二次开发`。
-- 不要用「jev-chat-windows」「Jev 聊天助手」「jev-chat」名称或 chatjevs.com 域名暗示由原作者出品或背书。
+  `基于 JevChat-Windows（https://github.com/jev-chat/jev-chat-windows）二次开发`。
+- 不要用「JevChat-Windows」「Jev 聊天助手」「jev-chat」名称或 chatjevs.com 域名暗示由原作者出品或背书。
 
 **第三方组件与商用**：本项目自己的代码是 MIT，但 Windows 发布包（PyInstaller 打的 zip）里打进了
 [PySide6-Fluent-Widgets](https://qfluentwidgets.com/)，该组件是 GPLv3 协议，非商用免费，商用需要
