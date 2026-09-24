@@ -115,10 +115,21 @@ def _set_key(env_name: str, value: str) -> None:
 
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as k:
             winreg.SetValueEx(k, env_name, 0, winreg.REG_SZ, value)
-        # 广播一下，之后新开的终端/进程就能看到；已经开着的 IDE 看不到也无所谓，启动时会读注册表
-        ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 2, 5000, None)
     except Exception:
         pass  # 非 Windows（本机 Mac 开发）走不到，忽略
+
+
+def _notify_env() -> None:
+    """告诉别的进程环境变量变了。不能用 SendMessageTimeout 对 HWND_BROADCAST：
+    它会逐个窗口等回复，超时 5 秒还按窗口数累加，保存按钮在界面线程上就卡死。
+    SendNotifyMessage 把消息交出去就返回。"""
+    try:
+        fn = ctypes.windll.user32.SendNotifyMessageW
+        fn.argtypes = (ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_wchar_p)
+        fn.restype = ctypes.c_int
+        fn(0xFFFF, 0x001A, 0, "Environment")  # HWND_BROADCAST, WM_SETTINGCHANGE
+    except Exception:
+        pass
 
 def jev_key() -> str:
     """判断那把 key，两家来源共用。"""
@@ -147,10 +158,14 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
     # 没重填就把老变量里的值抄进新名字，迁移一次性做完（_get_key 已经退回读过老的了）
+    wrote_key = False
     for env, typed in ((JEV_ENV, jev_key_text), (LLM_ENV, llm_key_text)):
         value = typed or ("" if _read_env(env) else _get_key(env))
         if value:
             _set_key(env, value)
+            wrote_key = True
+    if wrote_key:
+        _notify_env()
     n = context() if context_n is None else max(3, min(30, int(context_n)))
     # 空串 = 清掉，None = 原样留着（读原始字段，别读补过默认值的那个）
     keep = lambda new, name: str(_read(name) or "") if new is None else str(new).strip()
