@@ -58,4 +58,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.pack.outputs.zip }}
-          generate_release_notes: true
+          body: ""
+          generate_release_notes: false
