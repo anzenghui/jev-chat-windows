@@ -1,4 +1,4 @@
-# jev-chat-windows
+# JevChat-Windows
 
 ## 公众号
 

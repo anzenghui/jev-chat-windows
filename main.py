@@ -45,9 +45,9 @@ def target_of(title):
 
 def fill_reply(text):
     if state["hwnd"] is None:  # 子进程重开过，hwnd 可能换了，用最新的
-        raise RuntimeError("未找到微信窗口，请确认微信已打开")
+        raise RuntimeError("未找到聊天窗口，请确认已经打开")
     if state["area"] is None:
-        raise RuntimeError("微信输入区域尚不可用，请确认微信聊天窗口可见（不要最小化）")
+        raise RuntimeError("输入区域尚不可用，请确认聊天窗口可见（不要最小化）")
     if settings.reply_target() and ov.at_prefix_enabled():
         target = target_of(ov.current_chat())  # 填进去的是界面上正看着的那个会话的对象
         if target:
@@ -96,7 +96,7 @@ def on_toggle_capture(on):
         try:
             state["hwnd"] = find_wechat_hwnd()
         except RuntimeError:
-            ov.set_capture(False, "未找到微信窗口，打开微信后再开启采集")
+            ov.set_capture(False, "未找到聊天窗口，打开后再开启采集")
             return
         child = spawn_worker()
     capture_on.set()
@@ -268,7 +268,7 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     try:
         state["hwnd"] = find_wechat_hwnd()
     except RuntimeError:
-        ov.set_capture(False, "未找到微信窗口，打开微信后再开启采集")
+            ov.set_capture(False, "未找到聊天窗口，打开后再开启采集")
     else:
         capture_on.set()
         child = spawn_worker()

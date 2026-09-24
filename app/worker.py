@@ -97,7 +97,7 @@ def run(q, hwnd, enabled, debug_on):
         except Exception:
             _err(q)  # 一帧出错不退出
         time.sleep(0.05)
-    q.put(("dead", "采集停了（微信关了？）"))
+    q.put(("dead", "采集停了（聊天窗口关了？）"))
     try:
         cap.wait()  # 采集线程若是报错死的，这里把错抛出来
     except Exception:

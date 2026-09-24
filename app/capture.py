@@ -38,7 +38,7 @@ def find_wechat_hwnd():
 
     u32.EnumWindows(cb, 0)
     if not found:
-        raise RuntimeError("没找到 Weixin.exe / WeChat.exe 的可见窗口，微信开着吗？")
+        raise RuntimeError("没找到聊天窗口，开着吗？")
     return next((h for h, t in found if t == "微信"), found[0][0])
 
 

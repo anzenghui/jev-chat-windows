@@ -32,7 +32,7 @@ class _Canvas(QWidget):
         p.fillRect(self.rect(), QColor("#1b1f1d"))
         if self.img is None:
             p.setPen(QColor("#9aa6a0"))
-            p.drawText(self.rect(), Qt.AlignCenter, "等待画面…\n开着采集，微信有动静就会有帧")
+            p.drawText(self.rect(), Qt.AlignCenter, "等待画面…\n开着采集，聊天窗口有动静就会有帧")
             return
         # 等比铺满 + 居中；s 是「缩小后的帧 → 控件」的倍率，k 是子进程缩了多少
         s = min(self.width() / self.img.width(), self.height() / self.img.height())
