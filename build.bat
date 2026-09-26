@@ -16,6 +16,9 @@ python -m pip install -r requirements.txt pyinstaller || goto :fail
 
 echo Building ...
 pyinstaller --noconfirm --clean jev.spec || goto :fail
+if not exist "dist\jev-chat-windows\plugins\session_recognition" mkdir "dist\jev-chat-windows\plugins\session_recognition" || goto :fail
+copy /Y "plugins\session_recognition\plugin.json" "dist\jev-chat-windows\plugins\session_recognition\" >nul || goto :fail
+copy /Y "plugins\session_recognition\plugin.py" "dist\jev-chat-windows\plugins\session_recognition\" >nul || goto :fail
 
 echo.
 echo Build OK.

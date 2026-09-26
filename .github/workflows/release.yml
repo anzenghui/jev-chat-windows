@@ -41,6 +41,8 @@ jobs:
           $ver = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { $env:GITHUB_SHA.Substring(0, 7) }
           $zip = "jev-chat-windows-$ver.zip"
           Copy-Item -Path LICENSE, NOTICE -Destination 'dist\jev-chat-windows'
+          New-Item -ItemType Directory -Path 'dist\jev-chat-windows\plugins\session_recognition' -Force | Out-Null
+          Copy-Item -Path 'plugins\session_recognition\plugin.py', 'plugins\session_recognition\plugin.json' -Destination 'dist\jev-chat-windows\plugins\session_recognition'
           Compress-Archive -Path 'dist\jev-chat-windows' -DestinationPath $zip
           Add-Content -Path $env:GITHUB_OUTPUT -Value "zip=$zip"
           "{0}  {1:N1} MB" -f $zip, ((Get-Item $zip).Length / 1MB)

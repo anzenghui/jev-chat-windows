@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QSizeGrip, QSizePolicy,
+    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QSizeGrip, QSizePolicy,
     QStackedWidget, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
@@ -221,7 +221,8 @@ class _ReplyCard(_Surface):
 
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
-                 on_toggle_debug=None):
+                 on_toggle_debug=None, on_prepare_db=None, on_load_history=None,
+                 on_confirm_identity=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。"""
@@ -232,6 +233,11 @@ class Overlay:
         self.on_toggle_capture = on_toggle_capture
         self.on_target_change = on_target_change
         self.on_toggle_debug = on_toggle_debug
+        self.on_prepare_db = on_prepare_db
+        self.on_load_history = on_load_history
+        self.on_confirm_identity = on_confirm_identity
+        self._identity_candidates = []
+        self._identity_context = None
         self.result_of = result_of
         self.cands = []
         self.cards = []
@@ -241,9 +247,14 @@ class Overlay:
         self._pageLayouts = []
         self._hintLabels = []
         self.feeds = {}  # {会话名: [排好版的记录]}
+        self.db_history = {}
+        self.history_more = {}
         self.counts = {}  # {会话名: 消息条数}
         self.hers = {}  # {会话名: 对方最近一句}
         self.targets = {}  # {会话名: ([发言人], 当前回复对象)}
+        self._account_name = ""
+        self._snapshot_ready = False
+        self._recognition_tools_requested = False
         self._chat = ""  # 微信当前开着的会话
         self._shown = ""  # 界面上正在看的会话（浏览时和上面不一样）
         self.win = _MainWindow(self._relayout)
@@ -369,22 +380,23 @@ class Overlay:
         self.updated.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         heading.addWidget(self.updated)
         body.addLayout(heading)
-        chat_row = QHBoxLayout()
-        chat_row.setSpacing(8)
-        prefix = _label("当前会话", 12, _MUTED)
-        prefix.setFixedWidth(56)
-        chat_row.addWidget(prefix)
-        self.chatBox = _FitCombo()
-        self.chatBox.setPlaceholderText("尚未识别到会话")
-        self.chatBox.setAccessibleName("当前会话")
-        self.chatBox.setToolTip("聊天窗口切到哪个会话这里就跟到哪个；也可以自己选一个，只看它的记录和建议")
-        self.chatBox.currentIndexChanged.connect(self._on_chat_selected)
-        chat_row.addWidget(self.chatBox, 1)
-        self.chatFollow = _label("", 11, _MUTED)
-        self.chatFollow.setFixedWidth(52)
-        self.chatFollow.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        chat_row.addWidget(self.chatFollow)
-        body.addLayout(chat_row)
+        self.identityRow = QWidget()
+        identity_row = QHBoxLayout(self.identityRow)
+        identity_row.setContentsMargins(0, 0, 0, 0)
+        identity_row.setSpacing(8)
+        identity_prefix = _label("同名候选", 12, _MUTED)
+        identity_prefix.setFixedWidth(56)
+        identity_row.addWidget(identity_prefix)
+        self.identityBox = _FitCombo()
+        self.identityBox.setAccessibleName("选择当前微信会话身份")
+        self.identityBox.setToolTip("核对联系人备注和微信 ID 后选择")
+        identity_row.addWidget(self.identityBox, 1)
+        self.confirmIdentityButton = PushButton("确认身份")
+        self.confirmIdentityButton.setAccessibleName("确认当前微信会话身份")
+        self.confirmIdentityButton.clicked.connect(self._confirm_identity)
+        identity_row.addWidget(self.confirmIdentityButton)
+        self.identityRow.hide()
+        body.addWidget(self.identityRow)
         self.targetRow = QWidget()  # 只有开了「群聊指定回复对象」且这个会话是群聊才露出来
         target_row = QHBoxLayout(self.targetRow)
         target_row.setContentsMargins(0, 0, 0, 0)
@@ -474,10 +486,14 @@ class Overlay:
         self.feed = PlainTextEdit()
         self.feed.setReadOnly(True)
         self.feed.setPlaceholderText("识别到的聊天内容会显示在这里")
-        self.feed.setMaximumBlockCount(_LOG_LINES)
+        self.feed.setMaximumBlockCount(0)
         self.feed.setFixedHeight(160)
         self.feed.hide()
         body.addWidget(self.feed)
+        self.loadMoreButton = PushButton("加载更早记录")
+        self.loadMoreButton.clicked.connect(lambda: self.on_load_history(self._shown) if self.on_load_history else None)
+        self.loadMoreButton.hide()
+        body.addWidget(self.loadMoreButton)
         self._history_title()
         body.addStretch(1)
 
@@ -486,6 +502,7 @@ class Overlay:
         heading = QHBoxLayout()
         heading.addWidget(_tool(FIF.RETURN, "返回回复建议", self._back_home))
         heading.addWidget(_label("设置", 23, "#24382d", True), 1)
+        heading.addWidget(_tool(FIF.FOLDER, "数据库维护", self._toggle_recognition_tools))
         body.addLayout(heading)
         body.addWidget(_label("调整关系背景，配置判断和起草用的两个模型。", 13, _MUTED))
         preference = _Surface()
@@ -560,9 +577,29 @@ class Overlay:
         box.addLayout(debug_row)
         box.addWidget(self._hint(
             "另开一个窗口实时显示截到的画面和识别框：绿 = 我、蓝 = 对方、灰 = 过滤掉的灰字、"
-            "红 = 当成图片丢掉、黄 = 小字丢掉。只在内存里画，不存图。"
+            "红 = 图片文字候选、黄 = 小字候选。图片文字只展示，不推断发送方。只在内存里画，不存图。"
         ))
         body.addWidget(preference)
+
+        recognition = _Surface()
+        self.recognitionCard = recognition
+        rec_box = QVBoxLayout(recognition)
+        rec_box.setContentsMargins(16, 16, 16, 18)
+        rec_box.setSpacing(12)
+        rec_box.addWidget(_label("会话识别", 16, "#304c3c", True))
+        self.accountStatus = _label("等待微信窗口", 13, _MUTED)
+        rec_box.addWidget(self.accountStatus)
+        rec_box.addWidget(self._hint("自动跟随正在操作的微信窗口。数据库只复制到程序 data 目录后解密和查询；不会自动扫描进程内存。"))
+        prepare_row = QHBoxLayout()
+        self.prepareButton = PushButton("准备当前账号数据库")
+        self.prepareButton.clicked.connect(lambda: self.on_prepare_db(None) if self.on_prepare_db else None)
+        prepare_row.addWidget(self.prepareButton)
+        import_button = PushButton("选择密钥文件")
+        import_button.clicked.connect(self._choose_db_key)
+        prepare_row.addWidget(import_button)
+        rec_box.addLayout(prepare_row)
+        body.addWidget(recognition)
+        recognition.hide()
 
         models = _Surface()
         box = QVBoxLayout(models)
@@ -825,7 +862,7 @@ class Overlay:
             return
         self._load_settings()
         self._render_targets()  # 开关刚改过，回到首页时这一行该显该藏得重算一次
-        self._settings_feedback("设置已保存，将用于下一次回复。")
+        self._settings_feedback("设置已保存。")
         self.setupButton.hide()
         if not self.cands and not self._busy:
             self._empty_text()
@@ -967,14 +1004,77 @@ class Overlay:
             self.emptyHint.setText("请按上方提示处理。收到新的对方消息后会再次尝试。")
             self.setupButton.setVisible(not settings.has_key())
 
+    def set_account_status(self, account, snapshot_ready):
+        if account != self._account_name or (snapshot_ready and not self._snapshot_ready):
+            self._recognition_tools_requested = False
+        self._account_name = account
+        self._snapshot_ready = snapshot_ready
+        if not account:
+            self.accountStatus.setText("当前微信账号未确定")
+        elif snapshot_ready:
+            self.accountStatus.setText(f"当前账号：{account} · 数据已就绪")
+        else:
+            self.accountStatus.setText(f"当前账号：{account} · 缺少明文快照")
+        self._update_recognition_visibility()
+
+    def _toggle_recognition_tools(self):
+        self._recognition_tools_requested = not self._recognition_tools_requested
+        self._update_recognition_visibility()
+
+    def _update_recognition_visibility(self):
+        self.recognitionCard.setVisible(self._recognition_tools_requested or
+                                        bool(self._account_name and not self._snapshot_ready))
+
+    def _choose_db_key(self):
+        filename, _ = QFileDialog.getOpenFileName(self.win, "选择已有的数据库密钥文件", "", "JSON (*.json)")
+        if filename and self.on_prepare_db:
+            self.on_prepare_db(filename)
+
+    def set_prepare_busy(self, busy):
+        self.prepareButton.setEnabled(not busy)
+
     def _toggle_history(self):
         self.feed.setVisible(self.feed.isHidden())
+        self.loadMoreButton.setVisible(self.feed.isVisible() and self.history_more.get(self._shown, False))
         self._history_title()
 
     def _history_title(self):
         action = "展开" if self.feed.isHidden() else "收起"
-        count = self.counts.get(self._shown, 0)
+        count = len(self.db_history.get(self._shown, [])) + len(self.feeds.get(self._shown, []))
         self.historyButton.setText(f"{action}聊天记录" + (f" · {count}" if count else ""))
+
+    def set_history_page(self, chat, rows, more, first_page=False):
+        if first_page and not rows:
+            self.history_more[chat] = False
+            return
+        formatted = []
+        for timestamp, _shard, _rowid, sender, content in rows:
+            try:
+                when = datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")
+            except (OverflowError, OSError, ValueError):
+                when = "时间未知"
+            formatted.append(f"{when}  {sender or '消息'}\n{content}\n")
+        if first_page:
+            self.db_history[chat] = formatted
+            self.feeds[chat] = []
+        else:
+            self.db_history[chat] = formatted + self.db_history.get(chat, [])
+        self.history_more[chat] = more
+        if chat == self._shown:
+            self._render_feed(chat)
+            if not first_page and rows:
+                self.feed.verticalScrollBar().setValue(0)
+
+    def set_history_loading(self, chat, loading):
+        if chat == self._shown:
+            self.loadMoreButton.setEnabled(not loading)
+
+    def _render_feed(self, chat):
+        self.feed.clear()
+        for line in self.db_history.get(chat, []) + self.feeds.get(chat, []):
+            self.feed.appendPlainText(line)
+        self.loadMoreButton.setVisible(self.feed.isVisible() and self.history_more.get(chat, False))
+        self._history_title()
 
     def log(self, line):
         """采集状态行：只进正在看的那个会话，不按会话存。"""
@@ -987,7 +1087,7 @@ class Overlay:
     def log_message(self, who, text, name="", timestamp=None, chat=None):
         """按会话存一份；只有正在看的那个会往显示区里写。"""
         chat = chat or self._shown
-        speaker = (name or "对方") if who == "her" else "我"
+        speaker = (name or "对方") if who == "her" else ("图片" if who == "image" else "我")
         timestamp = timestamp or datetime.now().strftime("%H:%M")
         self.counts[chat] = self.counts.get(chat, 0) + 1
         lines = self.feeds.setdefault(chat, [])
@@ -995,7 +1095,6 @@ class Overlay:
         del lines[:-_LOG_LINES]
         if who == "her":
             self.hers[chat] = text
-        self._add_chat(chat)
         if chat != self._shown:
             return
         self.log(lines[-1])
@@ -1009,50 +1108,43 @@ class Overlay:
         self.context.show()
 
     def current_chat(self):
-        """界面上正在看的会话（不一定是微信当前开着的那个）。"""
+        """界面跟随的微信会话。"""
         return self._shown
 
+    def set_identity_candidates(self, context, candidates):
+        self._identity_context = context if candidates else None
+        self._identity_candidates = list(candidates)
+        self.identityBox.blockSignals(True)
+        self.identityBox.clear()
+        for username, label in self._identity_candidates:
+            self.identityBox.addItem(f"{label} · {username}" if label != username else username)
+        self.identityBox.blockSignals(False)
+        self.identityRow.setVisible(bool(candidates))
+
+    def _confirm_identity(self):
+        index = self.identityBox.currentIndex()
+        if (self._identity_context is not None and self.on_confirm_identity
+                and 0 <= index < len(self._identity_candidates)):
+            self.on_confirm_identity(self._identity_context, self._identity_candidates[index][0])
+
     def set_chat(self, title):
-        """微信切到了哪个会话：登记进下拉框并自动跟过去，不触发用户选择的回调。"""
+        """微信切到哪个会话，界面就跟到哪个会话。"""
         if not title:
             return
-        browsing = self._shown != self._chat  # 正看着的就是它、但之前是「浏览中」：也得重画，把填入放开
         self._chat = title
-        self._add_chat(title)
-        if title != self._shown or browsing:
-            self.chatBox.blockSignals(True)
-            self.chatBox.setCurrentIndex(self.chatBox.findText(title))
-            self.chatBox.blockSignals(False)
-            self._switch_to(title)
-        self._follow_text()
-
-    def _add_chat(self, title):
-        """新会话自动进下拉框；addItem 添第一条时会自己选中，别让它触发切换。"""
-        if not title or self.chatBox.findText(title) >= 0:
-            return
-        self.chatBox.blockSignals(True)
-        self.chatBox.addItem(title)
-        self.chatBox.blockSignals(False)
-
-    def _on_chat_selected(self, index):
-        """用户自己挑了一个会话：只换看的内容，微信那边不动。"""
-        title = self.chatBox.itemText(index)
-        if title and title != self._shown:
+        if title != self._shown:
             self._switch_to(title)
 
     def _switch_to(self, title):
         """换正在看的会话：记录、对方最近说、条数、上次的建议一起换过去。"""
         self._shown = title
-        self.feed.clear()
-        for line in self.feeds.get(title, []):
-            self.feed.appendPlainText(line)
+        self._render_feed(title)
         her = self.hers.get(title)
         if her:
             self._show_latest(her)
         else:
             self.context.hide()
         self._history_title()
-        self._follow_text()
         self._render_targets()
         self.show_cached(self.result_of(title) if self.result_of else None)
 
@@ -1077,7 +1169,7 @@ class Overlay:
         self.targetBox.blockSignals(False)
 
     def _on_target_selected(self, index):
-        """用户挑了回复对象。浏览别的会话时改的就是那个会话的对象——记录、候选也都按会话走，口径一致。"""
+        """用户挑了当前群聊的回复对象。"""
         name = self.targetBox.itemText(index)
         if not name:
             return
@@ -1091,12 +1183,8 @@ class Overlay:
         """填入时要不要带「@名字 」前缀（只记在界面上，不落盘）。"""
         return self.atCheck.isChecked()
 
-    def _follow_text(self):
-        self.chatFollow.setText(("跟随" if self._shown == self._chat else "浏览中") if self._chat else "")
-
     def show_cached(self, result):
-        """把某个会话上次的结果放回界面；没有就回到空态。浏览别的会话时只给看不给填——
-        微信当前开着的不是它，填进去就串会话了。"""
+        """把当前会话上次的结果放回界面；没有就回到空态。"""
         if result:
             self.show(result)
         else:
@@ -1107,9 +1195,6 @@ class Overlay:
             self.empty.show()
             self.updated.setText("")
             self._empty_text()
-        if self._shown != self._chat:
-            self.invalidate_replies()
-            self.set_status(f"正在浏览「{self._shown}」，只看不填；切回这个会话才能用。")
 
     def show(self, result):
         """按推荐顺序展示，按钮始终绑定 candidates 的原始索引。"""

@@ -9,9 +9,8 @@ import numpy as np
 u32 = ctypes.windll.user32
 
 
-def find_wechat_hwnd():
-    """枚举可见顶层窗口，按进程名挑主窗口，没有就取第一个。
-    同进程还有工具窗和看图窗，面积可能更大，所以不能按面积挑。"""
+def wechat_windows():
+    """可见微信主窗口；不把同进程的看图/工具窗口当成另一个账号。"""
     k32 = ctypes.windll.kernel32
     found = []
 
@@ -37,9 +36,40 @@ def find_wechat_hwnd():
         return True
 
     u32.EnumWindows(cb, 0)
-    if not found:
+    mains = [h for h, title in found if title in ("微信", "WeChat")]
+    return mains or ([found[0][0]] if len(found) == 1 else [])
+
+
+def choose_wechat_hwnd(windows, foreground, foreground_pid, current=None):
+    if foreground in windows:
+        return foreground
+    matches = []
+    for hwnd in windows:
+        pid = ctypes.c_ulong()
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if foreground_pid and pid.value == foreground_pid:
+            matches.append(hwnd)
+    if len(matches) == 1:
+        return matches[0]
+    if current in windows:
+        return current
+    return windows[0] if len(windows) == 1 else None
+
+
+def find_wechat_hwnd(current=None):
+    """跟随最近激活的微信窗口；多开且尚未激活任何一个时不猜。"""
+    windows = wechat_windows()
+    if not windows:
         raise RuntimeError("没找到聊天窗口，开着吗？")
-    return next((h for h, t in found if t == "微信"), found[0][0])
+    foreground = u32.GetForegroundWindow()
+    pid = ctypes.c_ulong()
+    u32.GetWindowThreadProcessId(foreground, ctypes.byref(pid))
+    from app.accounts import wechat_root_process
+    process = wechat_root_process(pid.value)
+    selected = choose_wechat_hwnd(windows, foreground, process.pid if process else 0, current)
+    if selected is None:
+        raise RuntimeError("请先点一下要使用的微信窗口")
+    return selected
 
 
 def unminimize(hwnd):
@@ -92,7 +122,7 @@ class Capture:
         from windows_capture import WindowsCapture
 
         self.settle, self.max_wait = settle, max_wait
-        self.shape = self.area = self.last = self.pending = None
+        self.shape = self.area = self.last = self.last_head = self.pending = None
         self.t = self.t0 = 0.0
         # 包装层默认 cursor_capture=True，会去调 SetIsCursorCaptureEnabled。
         # 这个属性要 Win10 2004（build 19041）才有，1909 及更早直接抛 CursorConfigUnsupported。
@@ -111,11 +141,13 @@ class Capture:
         if self.area is None:
             return
         x0, y0, x1, y1 = self.area[:4]  # 拿上一次的消息区做 diff 就够了，光标闪烁在输入框里，不算变化
-        # ponytail: diff 不含头部——公告条会滚动，带上它就永远停不稳。切会话时消息区必然也变，照样出帧。
+        # Header changes must also wake recognition, even when the message pane is unchanged.
         chat = full[y0:y1, x0:x1]
-        if self.last is not None and np.array_equal(chat, self.last):
+        header = full[self.area[5]:y0, x0:x1]
+        if (self.last is not None and np.array_equal(chat, self.last)
+                and self.last_head is not None and np.array_equal(header, self.last_head)):
             return
-        self.last = chat
+        self.last, self.last_head = chat, header
         if self.pending is None:
             self.t0 = time.perf_counter()
         self.pending, self.t = full, time.perf_counter()

@@ -20,22 +20,10 @@ def _engine():
     return _ENGINE
 
 
-def read_title(header):
-    """面板头部那一条截图 → 会话名（numpy RGB）。取最靠上的一行，同一行里取最左的
-    （右边是图标按钮，OCR 不出字；下面那行是公告）。群聊的成员数「(422)」去掉，只留名字当 key。
-    认不出返回 ""。一次约 60ms，所以调用方只在头部像素变了时才问。"""
-    res, _ = _engine()(header, use_cls=False)
-    if not res:
-        return ""
-    first = min(res, key=lambda r: r[0][0][1])
-    row = first[0][0][1] + (first[0][2][1] - first[0][0][1])  # 框底：顶在这之上的算同一行
-    text = min((r for r in res if r[0][0][1] < row), key=lambda r: r[0][0][0])[1]
-    return re.sub(r"\s*[（(]\d+[)）]\s*$", "", text.strip())
-
-
 def who_said(chat, box):
     """按 OCR 框里的颜色分类，不看 x 坐标。返回 (谁, 底色, 墨高)：
-    先看底色平不平：框里众数颜色占比 <45% 就是图片（头像/照片/表情包）里的字 → None 丢掉。
+    先看底色平不平：框里众数颜色占比 <45% 就是图片（头像/照片/表情包）里的字 → None，
+    由 Reader 单独聚合图片文字，不作为普通聊天气泡。
     绿底 → me；非绿且文字对底色对比度 ≥150 → her；其余（引用块、群里的发言人名、时间戳、系统提示、
     链接卡片描述——都是灰字，对比度 80~95）→ "gray"。
     实测：气泡正文对比度 178~208，me 绿泡 142~150，灰字 ≤ 93。深浅主题都靠这套。
@@ -48,7 +36,7 @@ def who_said(chat, box):
     bg = vals[cnt.argmax()]
     if cnt.max() / reg.shape[0] / reg.shape[1] < 0.45:
         # 文字必须落在平底色上：WGC 帧是精确像素，气泡/面板里众数颜色占 0.56~0.82，
-        # 头像/照片/表情包里只有 0.1~0.3——那是图片里的字（头像上的「借仲夏夜之梦」之类），不是消息。
+        # 头像/照片/表情包里只有 0.1~0.3；图片文字不能冒充普通消息。
         # ponytail: 只对精确像素的帧成立；缩放/压缩过的截图（比如拿预览窗再截一次的图）底色会糊成几百种颜色，全会被当图片。
         return None, bg, 0
     diff = np.abs(reg @ [0.299, 0.587, 0.114] - bg @ [0.299, 0.587, 0.114])
@@ -68,6 +56,32 @@ def similar(a, b):
     return len(a) == len(b) >= 3 and sum(x != y for x, y in zip(a, b)) <= 1  # 短句错一个字
 
 
+def _image_text_lines(boxes):
+    """Group OCR text inside large image bubbles; never infer its sender from text position."""
+    groups = []
+    for left, top, right, bottom, text in boxes:
+        if not text.strip():
+            continue
+        if groups:
+            group = groups[-1]
+            overlap = min(right, group[2]) - max(left, group[0])
+            if (0 <= top - group[3] <= 36
+                    and overlap >= 0.2 * min(right - left, group[2] - group[0])):
+                group[0] = min(group[0], left)
+                group[2] = max(group[2], right)
+                group[3] = max(group[3], bottom)
+                group[4].append(text.strip())
+                continue
+        groups.append([left, top, right, bottom, [text.strip()]])
+    result = []
+    for left, top, right, bottom, texts in groups:
+        width, height = right - left, bottom - top
+        if ((len(texts) >= 2 and width >= 100 and height >= 30)
+                or (len(texts) == 1 and width >= 160 and len(texts[0]) >= 10)):
+            result.append(("image", None, "[图片文字] " + "\n".join(texts)[:400], top))
+    return result
+
+
 class Reader:
     """一个会话一个 Reader：lh/seen 各自算各自的，切走再切回来不会把旧消息当新的重报一遍。"""
 
@@ -79,7 +93,7 @@ class Reader:
         self.last_ms = 0  # 上一帧 OCR 耗时
 
     def read(self, chat, pane_bg):
-        """→ [(who, name, text, y)]，同一气泡的多行已合并。who ∈ me/her；name 群聊里是发言人，单聊 None。
+        """→ [(who, name, text, y)]，同一气泡的多行已合并。who ∈ me/her/image；图片文字不推断发送方。
         顺带把每个框的分类记进 self.last_boxes（调试视图画框用，几十个 tuple，不开也不亏）。"""
         t0 = time.perf_counter()
         res, _ = self.ocr(chat, use_cls=False)
@@ -89,7 +103,7 @@ class Reader:
         # 群聊：每条 her 气泡上方一行灰色发言人名（靠左、短、不带冒号、印在面板底色上），从上往下扫，名字带给后面的气泡。
         # 引用块/时间戳/公告带冒号，链接卡片灰字印在气泡底色上，都不会被当成名字。
         # ponytail: 名字行被 OCR 漏掉时会挂到上一个人头上。
-        name, raw = None, []
+        name, raw, image_boxes = None, [], []
         for box, text, _ in sorted(res or [], key=lambda r: r[0][0][1]):
             kind, bg, h = who_said(chat, box)
             xs, ys = [p[0] for p in box], [p[1] for p in box]
@@ -103,8 +117,9 @@ class Reader:
                 self.last_boxes.append(rect + ("name" if taken else "gray", text))
                 continue
             if kind is None or (self.lh and h < 0.6 * self.lh):
-                # 字比正常气泡小得多 = 图片消息（截图/表情包）里的字，不是气泡
+                # 图片中的文字单独合并展示，不把它冒充对方的新消息。
                 self.last_boxes.append(rect + ("image" if kind is None else "tiny", text))
+                image_boxes.append(rect + (text,))
                 continue
             self.last_boxes.append(rect + (kind, text))
             raw.append((kind, name if kind == "her" else None, text, box[0][1], box[2][1], h))
@@ -118,7 +133,8 @@ class Reader:
                 lines[-1][4] = bottom
             else:
                 lines.append([who, nm, text, top, bottom])
-        return [(w, n, t, y) for w, n, t, y, _ in lines]
+        result = [(w, n, t, y) for w, n, t, y, _ in lines]
+        return sorted(result + _image_text_lines(image_boxes), key=lambda line: line[3])
 
     def new_lines(self, lines):
         """去重（滚动不重复）→ 这一帧里真正新出现的 [(who, name, text)]。

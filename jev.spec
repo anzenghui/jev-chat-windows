@@ -9,7 +9,7 @@ NAME = "jev-chat-windows"
 hiddenimports = [
     # spawn 出来的采集子进程按名字 import app.worker，再顺着它拉 capture/ocr；
     # 父进程这边 engine 也是运行时才走到，一并钉死，别指望静态分析都能扫出来
-    "app.worker", "app.capture", "app.ocr", "app.fill", "app.overlay", "app.settings",
+    "app.worker", "app.capture", "app.accounts", "app.db_snapshot", "app.db_incremental", "app.snapshot_lock", "app.history", "app.ocr", "app.plugin_api", "app.plugin_loader", "app.fill", "app.overlay", "app.settings",
     "app.version", "app.update", "app.debugwin",  # debugwin 是开了调试视图才 import 的
     "core.engine", "core.draft", "core.jev_client", "core.questions", "core.providers",
     "core.llm",
@@ -21,6 +21,11 @@ for pkg in (
     "onnxruntime",           # capi 下面那堆 DLL
     "qfluentwidgets",        # qss / 图标资源
     "windows_capture",       # Rust 编译的 .pyd
+    "zstandard",            # compressed WeChat message text in read-only snapshots
+    "psutil",               # selected WeChat process open-file evidence
+    "cryptography",         # decrypt copied SQLCipher pages only
+    "uiautomation",          # full current-chat title; plugin lives beside EXE
+    "comtypes",              # UIA COM bindings
     # 四个模型 SDK：core/llm.py 和 jev_client 里是**函数内 import**，静态分析扫不到，必须显式收
     "openai",
     "typesafe_sdk",

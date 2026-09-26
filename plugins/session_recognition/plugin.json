@@ -1,0 +1,7 @@
+{
+  "id": "session_recognition",
+  "version": "0.4.1",
+  "api_version": 1,
+  "capability": "recognizer",
+  "entry": "plugin.py"
+}
