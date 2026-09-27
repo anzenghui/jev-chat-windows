@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -36,6 +36,38 @@ class RecognitionTests(unittest.TestCase):
         with closing(sqlite3.connect(self.root / "message" / "message_0.db")) as db, db:
             db.execute(f'CREATE TABLE "{table}"(create_time INTEGER, message_content TEXT)')
             db.executemany(f'INSERT INTO "{table}" VALUES (?,?)', enumerate(texts, 1))
+
+    def test_contact_details_use_confirmed_id_not_duplicate_name(self):
+        with closing(sqlite3.connect(self.root / "contact" / "contact.db")) as db, db:
+            db.execute("ALTER TABLE contact ADD COLUMN small_head_url TEXT")
+            db.execute("UPDATE contact SET remark=?, small_head_url=? WHERE username=?",
+                       ("客户甲", "http://wx.qlogo.cn/a", "wxid_a"))
+            db.execute("UPDATE contact SET remark=?, small_head_url=? WHERE username=?",
+                       ("客户乙", "http://wx.qlogo.cn/b", "wxid_b"))
+        first = plugin.read_contact(self.root, "wxid_a")
+        second = plugin.read_contact(self.root, "wxid_b")
+        self.assertEqual(first["nickname"], second["nickname"])
+        self.assertEqual(first["remark"], "客户甲")
+        self.assertEqual(second["remark"], "客户乙")
+        self.assertEqual(second["avatar_url"], "http://wx.qlogo.cn/b")
+        self.assertIsNone(plugin.read_contact(self.root, "wxid_missing"))
+        with closing(sqlite3.connect(self.root / "contact" / "contact.db")) as db, db:
+            db.execute("ALTER TABLE contact ADD COLUMN big_head_url TEXT")
+            db.execute("UPDATE contact SET small_head_url='', big_head_url=? WHERE username=?",
+                       ("https://wx.qlogo.cn/large", "wxid_b"))
+        self.assertEqual(plugin.read_contact(self.root, "wxid_b")["avatar_url"],
+                         "https://wx.qlogo.cn/large")
+
+    def test_avatar_fetch_only_uses_bounded_wechat_cdn_images(self):
+        self.assertEqual(plugin.fetch_avatar("http://127.0.0.1/private"), b"")
+        self.assertEqual(plugin.fetch_avatar("http://wx.qlogo.cn:bad/a"), b"")
+        response = Mock(status=200, headers={"Content-Type": "image/png"})
+        response.read.return_value = b"png-bytes"
+        with patch.object(plugin, "build_opener") as opener:
+            opener.return_value.open.return_value.__enter__.return_value = response
+            self.assertEqual(plugin.fetch_avatar("http://wx.qlogo.cn/a"), b"png-bytes")
+            self.assertEqual(opener.return_value.open.call_args.args[0].full_url,
+                             "https://wx.qlogo.cn/a")
 
     def test_unique_title_confirms_contact_id(self):
         match = Resolver(self.root).resolve("李四")

@@ -45,6 +45,10 @@ def load_plugin(plugin_id, capability, root=None):
                 hasattr(module, name) for name in (
                     "read_header", "Match", "Recognition")):
             raise ValueError("识别插件缺少必需接口")
+        if capability == "profile_provider" and not callable(getattr(module, "fetch_profile", None)):
+            raise ValueError("画像插件缺少查询接口")
+        if capability == "media_preview" and not callable(getattr(module, "preview_message", None)):
+            raise ValueError("图片插件缺少预览接口")
     except Exception:
         sys.modules.pop(module_name, None)
         raise

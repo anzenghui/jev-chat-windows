@@ -9,7 +9,75 @@ import main
 
 
 class FollowWindowTests(unittest.TestCase):
-    def test_image_ocr_is_displayed_without_triggering_reply(self):
+    def test_confirmed_contact_lookup_uses_exact_snapshot_and_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            contact = Path(temp) / "contact"
+            contact.mkdir()
+            (contact / "contact.db").touch()
+            context = ("当前会话", temp, "wxid_b")
+            events = queue.Queue()
+            overlay = Mock()
+            state = {"confirmed": True}
+            plugin = SimpleNamespace(read_contact=lambda snapshot, username: {
+                "username": username, "nickname": "已识别", "remark": snapshot})
+
+            def immediate_thread(target, daemon):
+                return Mock(start=target)
+
+            with (patch.object(main, "ov", overlay, create=True),
+                  patch.object(main, "state", state),
+                  patch.object(main, "wechat_contact_result", events),
+                  patch.object(main, "load_plugin", return_value=plugin),
+                  patch.object(main.threading, "Thread", side_effect=immediate_thread)):
+                main.request_wechat_contact(*context)
+            generation, received, info = events.get_nowait()
+            self.assertEqual(generation, state["contact_generation"])
+            self.assertEqual(received, context)
+            self.assertEqual(info["username"], "wxid_b")
+            self.assertEqual(info["remark"], temp)
+            overlay.set_wechat_contact.assert_called_once_with(status="正在读取微信资料")
+
+    def test_unconfirmed_chat_clears_identified_contact(self):
+        incoming = Mock()
+        incoming.get_nowait.side_effect = [
+            ("chat", "新会话 [未确认]", False, "待确认", "", ""), queue.Empty]
+        overlay = Mock()
+        state = {"chat": "旧会话", "confirmed": True, "contact_generation": 3,
+                 "contact_context": ("旧会话", "old-snapshot", "wxid_a")}
+        with (patch.object(main, "q", incoming, create=True),
+              patch.object(main, "ov", overlay, create=True),
+              patch.object(main, "state", state),
+              patch.object(main, "history_sources", {}),
+              patch.object(main, "history_state", {})):
+            main.drain()
+        self.assertFalse(state["confirmed"])
+        self.assertIsNone(state["contact_context"])
+        self.assertEqual(state["contact_generation"], 4)
+        overlay.set_wechat_contact.assert_called_once_with()
+
+    def test_stale_contact_and_avatar_results_do_not_replace_current_chat(self):
+        old = ("旧会话", "snapshot-a", "wxid_a")
+        current = ("当前会话", "snapshot-b", "wxid_b")
+        info = {"username": "wxid_b", "nickname": "当前联系人", "remark": "备注", "avatar_url": ""}
+        contacts, avatars = queue.Queue(), queue.Queue()
+        contacts.put((1, old, {"username": "wxid_a", "nickname": "旧联系人"}))
+        contacts.put((2, current, info))
+        avatars.put((1, old, "https://wx.qlogo.cn/old", b"old"))
+        avatars.put((2, current, "https://wx.qlogo.cn/new", b"new"))
+        overlay = Mock()
+        state = {"confirmed": True, "contact_generation": 2, "contact_context": current}
+        cache = {}
+        with (patch.object(main, "ov", overlay, create=True), patch.object(main, "state", state),
+              patch.object(main, "wechat_contact_result", contacts),
+              patch.object(main, "wechat_avatar_result", avatars),
+              patch.object(main, "wechat_avatar_cache", cache)):
+            main.drain_wechat_contact()
+        self.assertEqual(overlay.set_wechat_contact.call_count, 2)
+        overlay.set_wechat_contact.assert_any_call(info, status="已确认会话，未找到联系人资料")
+        overlay.set_wechat_contact.assert_any_call(info, avatar=b"new")
+        self.assertEqual(cache, {"https://wx.qlogo.cn/new": b"new"})
+
+    def test_image_ocr_does_not_replace_confirmed_database_latest(self):
         incoming = Mock()
         incoming.get_nowait.side_effect = [
             ("lines", "chat", [("image", None, "[图片文字] 一段文字")], (1, 2, 3, 4)), queue.Empty]
@@ -24,7 +92,7 @@ class FollowWindowTests(unittest.TestCase):
               patch.object(main, "start_analyze") as generate):
             main.drain()
             self.assertEqual(list(main.chat_of("chat")["history"]), [])
-        overlay.log_message.assert_called_once_with("image", "[图片文字] 一段文字", None, chat="chat")
+        overlay.log_message.assert_not_called()
         generate.assert_not_called()
 
     def test_manual_choice_requires_current_window_and_account(self):
@@ -62,29 +130,90 @@ class FollowWindowTests(unittest.TestCase):
         commands.put.assert_called_once_with(("revoke", 11))
         fill.assert_not_called()
 
-    def test_legacy_snapshot_refreshes_only_session_copy(self):
+    def test_legacy_snapshot_is_prepared_once_in_background(self):
         with tempfile.TemporaryDirectory() as snapshot:
             state = {"account_root": "account", "snapshot": snapshot,
                      "hwnd": 11, "chat": "", "confirmed": False, "next_db_sync": 0}
             lock = Mock()
             lock.acquire.return_value = True
             events = queue.Queue()
+            overlay = Mock()
 
             def immediate_thread(target, daemon):
                 return Mock(start=lambda: target())
 
             with (patch.object(main, "state", state),
                   patch.object(main, "capture_on", Mock(is_set=Mock(return_value=True)), create=True),
-                  patch.object(main, "sync_lock", lock),
+                  patch.object(main, "prepare_lock", lock),
+                  patch.object(main, "auto_prepare_result", events),
+                  patch.object(main, "ov", overlay, create=True),
+                  patch.object(main.threading, "Thread", side_effect=immediate_thread),
+                  patch("app.db_snapshot.prepare_database") as prepare,
+                  patch("app.db_incremental.sync_account") as sync):
+                main.poll_database_sync()
+                state["next_db_sync"] = 0
+                main.poll_database_sync()
+                main.drain_auto_prepare_result()
+            lock.acquire.assert_called_once_with(blocking=False)
+            prepare.assert_called_once()
+            self.assertEqual(prepare.call_args.args, ("account",))
+            self.assertIn("cancelled", prepare.call_args.kwargs)
+            sync.assert_not_called()
+            overlay.set_prepare_busy.assert_any_call(False)
+
+    def test_missing_key_does_not_retry_auto_prepare(self):
+        state = {"account_root": "account", "snapshot": "", "hwnd": 11,
+                 "chat": "", "confirmed": False, "next_db_sync": 0}
+        events = queue.Queue()
+
+        def immediate_thread(target, daemon):
+            return Mock(start=target)
+
+        with (patch.object(main, "state", state),
+              patch.object(main, "capture_on", Mock(is_set=Mock(return_value=True)), create=True),
+              patch.object(main, "prepare_lock", Mock(acquire=Mock(return_value=True))),
+              patch.object(main, "auto_prepare_result", events),
+              patch.object(main, "ov", Mock(), create=True),
+              patch.object(main.threading, "Thread", side_effect=immediate_thread),
+              patch("app.db_snapshot.prepare_database", side_effect=ValueError("缺少该账号的数据库密钥")) as prepare):
+            main.poll_database_sync()
+            main.drain_auto_prepare_result()
+            state["next_db_sync"] = 0
+            main.poll_database_sync()
+        prepare.assert_called_once()
+        self.assertEqual(state["next_auto_prepare"], float("inf"))
+
+    def test_auto_prepare_result_from_previous_account_is_ignored(self):
+        events = queue.Queue()
+        events.put((("old-account", "old-snapshot"), None, None))
+        state = {"account_root": "new-account", "auto_prepare_key": None}
+        overlay = Mock()
+        with (patch.object(main, "state", state),
+              patch.object(main, "auto_prepare_result", events),
+              patch.object(main, "ov", overlay, create=True)):
+            main.drain_auto_prepare_result()
+        overlay.set_status.assert_not_called()
+
+    def test_prepared_snapshot_uses_incremental_sync(self):
+        with tempfile.TemporaryDirectory() as snapshot:
+            (Path(snapshot) / "sync.json").touch()
+            state = {"account_root": "account", "snapshot": snapshot,
+                     "hwnd": 11, "chat": "", "confirmed": False, "next_db_sync": 0}
+            events = queue.Queue()
+
+            def immediate_thread(target, daemon):
+                return Mock(start=target)
+
+            with (patch.object(main, "state", state),
+                  patch.object(main, "capture_on", Mock(is_set=Mock(return_value=True)), create=True),
                   patch.object(main, "sync_result", events),
                   patch.object(main.threading, "Thread", side_effect=immediate_thread),
-                  patch("app.db_incremental.refresh_legacy_session", return_value=True) as refresh,
-                  patch("app.db_incremental.refresh_legacy_contact", return_value=False) as contact_refresh):
+                  patch("app.db_incremental.sync_account", return_value=(["message/message_2.db"], False)) as sync,
+                  patch("app.db_snapshot.prepare_database") as prepare):
                 main.poll_database_sync()
-            lock.acquire.assert_called_once_with(blocking=False)
-            refresh.assert_called_once()
-            contact_refresh.assert_called_once()
-            self.assertEqual(events.get_nowait()[2], ["session/session.db"])
+            sync.assert_called_once()
+            prepare.assert_not_called()
+            self.assertEqual(events.get_nowait()[2], ["message/message_2.db"])
 
     def test_first_visible_messages_are_context_not_new_triggers(self):
         incoming = Mock()

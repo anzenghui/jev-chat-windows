@@ -73,6 +73,23 @@ class SnapshotTests(unittest.TestCase):
                 self.assertFalse((cache / "ready.json").exists())
                 self.assertEqual(source.read_bytes(), bytes(4096))
 
+    def test_cancelled_prepare_keeps_previous_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "wxid_a" / "db_storage"
+            source = root / "contact" / "contact.db"
+            source.parent.mkdir(parents=True)
+            source.touch()
+            cache = base / "cache"
+            cache.mkdir()
+            ready = cache / "ready.json"
+            ready.write_text(json.dumps({"generation": "snapshot-old"}), encoding="utf-8")
+            with patch.object(db_snapshot, "account_cache", return_value=cache):
+                with self.assertRaises(InterruptedError):
+                    db_snapshot.prepare_database(root, cancelled=lambda: True)
+            self.assertEqual(json.loads(ready.read_text(encoding="utf-8"))["generation"], "snapshot-old")
+            self.assertFalse(list(cache.glob("snapshot-*")))
+
 
 if __name__ == "__main__":
     unittest.main()

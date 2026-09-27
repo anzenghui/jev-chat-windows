@@ -19,6 +19,16 @@ pyinstaller --noconfirm --clean jev.spec || goto :fail
 if not exist "dist\jev-chat-windows\plugins\session_recognition" mkdir "dist\jev-chat-windows\plugins\session_recognition" || goto :fail
 copy /Y "plugins\session_recognition\plugin.json" "dist\jev-chat-windows\plugins\session_recognition\" >nul || goto :fail
 copy /Y "plugins\session_recognition\plugin.py" "dist\jev-chat-windows\plugins\session_recognition\" >nul || goto :fail
+if not exist "dist\jev-chat-windows\plugins\contact_profile" mkdir "dist\jev-chat-windows\plugins\contact_profile" || goto :fail
+copy /Y "plugins\contact_profile\plugin.json" "dist\jev-chat-windows\plugins\contact_profile\" >nul || goto :fail
+copy /Y "plugins\contact_profile\plugin.py" "dist\jev-chat-windows\plugins\contact_profile\" >nul || goto :fail
+if not exist "dist\jev-chat-windows\plugins\chat_media" mkdir "dist\jev-chat-windows\plugins\chat_media" || goto :fail
+copy /Y "plugins\chat_media\plugin.json" "dist\jev-chat-windows\plugins\chat_media\" >nul || goto :fail
+copy /Y "plugins\chat_media\plugin.py" "dist\jev-chat-windows\plugins\chat_media\" >nul || goto :fail
+if exist "data\ahu_profile_cli.json" (
+    if not exist "dist\jev-chat-windows\data" mkdir "dist\jev-chat-windows\data" || goto :fail
+    copy /Y "data\ahu_profile_cli.json" "dist\jev-chat-windows\data\" >nul || goto :fail
+)
 
 echo.
 echo Build OK.

@@ -196,7 +196,7 @@ def _check_sqlite(path):
             raise ValueError("数据库副本一致性检查失败。")
 
 
-def prepare_database(root, key_file=None):
+def prepare_database(root, key_file=None, cancelled=None):
     """Copy first, then decrypt/query only copies; publish after every shard passes."""
     root = Path(root).resolve()
     cache = account_cache(root)
@@ -217,11 +217,13 @@ def prepare_database(root, key_file=None):
         with tempfile.TemporaryDirectory(dir=cache) as copy_dir:
             copied_root = Path(copy_dir)
             for source in sources:
+                if cancelled is not None and cancelled():
+                    raise InterruptedError("账号已切换。")
                 relative = source.relative_to(root)
                 copied = copied_root / relative
                 output = stage / relative
                 output.parent.mkdir(parents=True, exist_ok=True)
-                source_sig = _copy_live_files(source, copied)
+                source_sig = _copy_live_files(source, copied, cancelled)
                 with copied.open("rb") as stream:
                     plaintext = stream.read(16) == HEADER
                 if plaintext:
@@ -230,17 +232,23 @@ def prepare_database(root, key_file=None):
                             src.backup(dst)
                 else:
                     key = _matching_key(copied, candidates)
-                    _decrypt_copy(copied, output, key)
+                    _decrypt_copy(copied, output, key, cancelled)
                     matched[str(relative).replace("/", "\\")] = {"enc_key": key.hex()}
                 _check_sqlite(output)
+                if cancelled is not None and cancelled():
+                    raise InterruptedError("账号已切换。")
                 from app.db_incremental import initial_entry
                 sync[relative.as_posix()] = initial_entry(copied, not plaintext, source_sig)
+        if cancelled is not None and cancelled():
+            raise InterruptedError("账号已切换。")
         if matched:
             temporary_keys = cache / "keys.json.tmp"
             temporary_keys.write_text(json.dumps(matched), encoding="utf-8")
             os.replace(temporary_keys, cache / "keys.json")
         (stage / "sync.json").write_text(json.dumps(sync), encoding="utf-8")
         manifest = {"source": str(root), "generation": generation}
+        if cancelled is not None and cancelled():
+            raise InterruptedError("账号已切换。")
         temporary = cache / "ready.json.tmp"
         temporary.write_text(json.dumps(manifest), encoding="utf-8")
         os.replace(temporary, cache / "ready.json")

@@ -33,13 +33,86 @@ state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "", "
 results = queue.Queue()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
 prepare_result = queue.Queue()
+auto_prepare_result = queue.Queue()
 prepare_lock = threading.Lock()
 history_result = queue.Queue()
 history_sources = {}
 history_state = {}
+cli_profile_result = queue.Queue()
+cli_profile_lock = threading.Lock()
+wechat_contact_result = queue.Queue()
+wechat_avatar_result = queue.Queue()
+wechat_avatar_cache = {}
 sync_result = queue.Queue()
 sync_lock = threading.Lock()
 commands = None
+
+
+def clear_wechat_contact():
+    state["contact_generation"] = state.get("contact_generation", 0) + 1
+    state["contact_context"] = None
+    state["contact_info"] = None
+    ov.set_wechat_contact()
+
+
+def request_wechat_contact(chat, snapshot, username, force=False):
+    context = (chat, snapshot, username)
+    if not state.get("confirmed") or not all(context):
+        clear_wechat_contact()
+        return
+    if context == state.get("contact_context") and not force:
+        return
+    state["contact_generation"] = state.get("contact_generation", 0) + 1
+    generation = state["contact_generation"]
+    state["contact_context"] = context
+    state["contact_info"] = None
+    ov.set_wechat_contact(status="正在读取微信资料")
+    if not (Path(snapshot) / "contact" / "contact.db").is_file():
+        ov.set_wechat_contact(status="已确认会话，联系人资料不可用")
+        return
+
+    def work():
+        try:
+            info = load_plugin("session_recognition", "recognizer").read_contact(snapshot, username)
+        except Exception:
+            info = None
+        wechat_contact_result.put((generation, context, info))
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def drain_wechat_contact():
+    while not wechat_contact_result.empty():
+        generation, context, info = wechat_contact_result.get()
+        if (generation != state.get("contact_generation") or context != state.get("contact_context")
+                or not state.get("confirmed")):
+            continue
+        state["contact_info"] = info
+        ov.set_wechat_contact(info, status="已确认会话，未找到联系人资料")
+        url = info.get("avatar_url") if info else ""
+        if not url:
+            continue
+        if url in wechat_avatar_cache:
+            ov.set_wechat_contact(info, avatar=wechat_avatar_cache[url])
+            continue
+
+        def work(current_generation=generation, current_context=context, avatar_url=url):
+            try:
+                avatar = load_plugin("session_recognition", "recognizer").fetch_avatar(avatar_url)
+            except Exception:
+                avatar = b""
+            wechat_avatar_result.put((current_generation, current_context, avatar_url, avatar))
+
+        threading.Thread(target=work, daemon=True).start()
+    while not wechat_avatar_result.empty():
+        generation, context, url, avatar = wechat_avatar_result.get()
+        if (generation != state.get("contact_generation") or context != state.get("contact_context")
+                or not state.get("confirmed") or not avatar or not state.get("contact_info")):
+            continue
+        if len(wechat_avatar_cache) >= 32:
+            wechat_avatar_cache.pop(next(iter(wechat_avatar_cache)))
+        wechat_avatar_cache[url] = avatar
+        ov.set_wechat_contact(state["contact_info"], avatar=avatar)
 
 
 def chat_of(title):
@@ -73,6 +146,7 @@ def fill_reply(text):
             same_window = same_account = False
         if not same_window or not same_account:
             state["confirmed"] = False
+            clear_wechat_contact()
             ov.invalidate_replies()
             if commands is not None:
                 commands.put(("revoke", state["hwnd"]))
@@ -119,11 +193,14 @@ def follow_wechat_window():
     for chat in chats.values():
         chat["rev"] += 1
     state.update(hwnd=selected, area=None, chat="", confirmed=False, rerun=None, busy=False,
-                 account_root="", snapshot="", candidate_context=None, manual_context=None)
+                 account_root="", snapshot="", candidate_context=None, manual_context=None,
+                 auto_prepare_key=None)
     ov.set_busy(False)
+    ov.set_prepare_busy(False)
     ov.invalidate_replies()
     ov.set_account_status("", False)
     ov.set_identity_candidates(None, [])
+    clear_wechat_contact()
     if selected is None:
         ov.set_status(reason, "warning")
         return
@@ -160,6 +237,7 @@ def on_toggle_capture(on):
         capture_on.clear()
         state["confirmed"] = False
         state["manual_context"] = None
+        clear_wechat_contact()
         ov.invalidate_replies()
         return
     if child is None:
@@ -225,11 +303,16 @@ def on_prepare_db(key_file=None):
     threading.Thread(target=work, daemon=True).start()
 
 
-def on_load_history(chat):
+def on_load_history(chat, refresh=False):
     source = history_sources.get(chat)
     if not source:
         return
     page = history_state.setdefault(chat, {"cursor": None, "loaded": False, "loading": False, "more": True})
+    if refresh:
+        if page["loading"]:
+            page["refresh_pending"] = True
+            return
+        page = history_state[chat] = {"cursor": None, "loaded": False, "loading": False, "more": True}
     if page["loading"] or (page["loaded"] and not page["more"]):
         return
     page["loading"] = True
@@ -247,31 +330,90 @@ def on_load_history(chat):
     threading.Thread(target=work, daemon=True).start()
 
 
+def latest_incoming_from_rows(rows, username, account_root):
+    own_username = Path(account_root).parent.name if account_root else ""
+    group = username.endswith("@chatroom")
+    for _stamp, _shard, _rowid, sender, content, _image in reversed(rows):
+        if sender == username or (group and sender and sender != own_username):
+            return content
+    return ""
+
+
+def refresh_cli_profile(show_results=False):
+    if not cli_profile_lock.acquire(blocking=False):
+        return
+    query = ov.profile_query()
+    if not query:
+        cli_profile_lock.release()
+        ov.set_external_profile(error="请输入查询问题")
+        return
+    ov.set_external_profile(loading=True)
+
+    def work():
+        try:
+            plugin = load_plugin("contact_profile", "profile_provider")
+            cli_profile_result.put((plugin.fetch_profile(query=query), "", show_results))
+        except ValueError as exc:
+            cli_profile_result.put((None, str(exc), show_results))
+        except Exception:
+            cli_profile_result.put((None, "读取用户画像失败", show_results))
+        finally:
+            cli_profile_lock.release()
+
+    threading.Thread(target=work, daemon=True).start()
+
+
 def poll_database_sync():
     if time.monotonic() < state.get("next_db_sync", 0):
         return
     state["next_db_sync"] = time.monotonic() + 1.0
     root, snapshot, hwnd = state.get("account_root"), state.get("snapshot"), state["hwnd"]
     username = history_sources.get(state.get("chat"), (None, ""))[1] if state.get("confirmed") else ""
-    if (not root or not snapshot or not capture_on.is_set()
-            or not sync_lock.acquire(blocking=False)):
+    if not root or not capture_on.is_set():
+        return
+
+    if not snapshot or not (Path(snapshot) / "sync.json").is_file():
+        key = (root, snapshot)
+        if state.get("auto_prepare_key") != key:
+            state["auto_prepare_key"] = key
+            state["next_auto_prepare"] = 0
+        if time.monotonic() < state["next_auto_prepare"] or not prepare_lock.acquire(blocking=False):
+            return
+        state["next_auto_prepare"] = float("inf")
+        ov.set_prepare_busy(True)
+        ov.set_status("正在后台准备当前账号数据库", "busy")
+
+        def prepare_work():
+            try:
+                from app.db_snapshot import prepare_database
+                cancelled = lambda: (state["hwnd"] != hwnd or state.get("account_root") != root
+                                     or not capture_on.is_set())
+                prepare_database(root, cancelled=cancelled)
+                auto_prepare_result.put((key, None, None))
+            except InterruptedError:
+                auto_prepare_result.put((key, None, 0))
+            except ValueError as exc:
+                error = str(exc)
+                retry = 30 if "稍后重试" in error or "正在写入" in error else None
+                auto_prepare_result.put((key, error, retry))
+            except Exception:
+                auto_prepare_result.put((key, "数据库准备失败，请检查空间、文件权限或密钥文件。", None))
+            finally:
+                prepare_lock.release()
+
+        threading.Thread(target=prepare_work, daemon=True).start()
+        return
+
+    if not sync_lock.acquire(blocking=False):
         return
 
     def work():
         try:
-            from app.db_incremental import refresh_legacy_contact, refresh_legacy_session, sync_account
+            from app.db_incremental import sync_account
             cancelled = lambda: state["hwnd"] != hwnd or state.get("account_root") != root or not capture_on.is_set()
-            if (Path(snapshot) / "sync.json").is_file():
-                changed, rebased = sync_account(
-                    root, snapshot, username=username, cancelled=cancelled,
-                    progress=lambda kind: sync_result.put((root, snapshot, [], True, "syncing")) if kind == "rebase" else None)
-            else:
-                changed = []
-                if refresh_legacy_session(root, snapshot, cancelled):
-                    changed.append("session/session.db")
-                if refresh_legacy_contact(root, snapshot, cancelled):
-                    changed.append("contact/contact.db")
-                rebased = False
+            changed, rebased = sync_account(
+                root, snapshot, username=username, cancelled=cancelled,
+                progress=lambda kind: sync_result.put((root, snapshot, [], True, "syncing")) if kind == "rebase" else None)
             if changed:
                 sync_result.put((root, snapshot, changed, rebased, None))
         except ValueError as exc:
@@ -284,6 +426,20 @@ def poll_database_sync():
             sync_lock.release()
 
     threading.Thread(target=work, daemon=True).start()
+
+
+def drain_auto_prepare_result():
+    while not auto_prepare_result.empty():
+        key, error, retry = auto_prepare_result.get()
+        if key != state.get("auto_prepare_key") or key[0] != state.get("account_root"):
+            continue
+        ov.set_prepare_busy(False)
+        if retry is not None:
+            state["next_auto_prepare"] = time.monotonic() + retry
+        if error:
+            ov.set_status(error, "warning")
+        elif retry is None:
+            ov.set_status("数据库副本已就绪，正在重新识别会话", "success")
 
 
 def start_analyze(title, msgs):
@@ -349,11 +505,17 @@ def drain():
             state["candidate_context"] = None
             ov.set_identity_candidates(None, [])
             source = (msg[4], msg[5]) if msg[2] and len(msg) > 5 else None
+            if source:
+                request_wechat_contact(msg[1], *source)
+            else:
+                clear_wechat_contact()
             if source and history_sources.get(msg[1]) != source:
                 history_sources[msg[1]] = source
                 history_state.pop(msg[1], None)
+                ov.set_database_latest(msg[1], "")
                 on_load_history(msg[1])
             if not msg[2]:
+                ov.set_database_latest(msg[1], "")
                 ov.invalidate_replies()
                 ov.set_status(msg[3] or "会话身份待确认", "warning")
             elif not was_confirmed or previous_chat != msg[1]:
@@ -367,8 +529,14 @@ def drain():
                 ov.set_identity_candidates(context, msg[6])
             continue
         if kind == "account":
+            new_root = msg[3] if len(msg) > 3 else ""
+            if new_root != state.get("account_root", ""):
+                state["auto_prepare_key"] = None
+                ov.set_prepare_busy(False)
+            if (msg[4] if len(msg) > 4 else "") != state.get("snapshot", ""):
+                clear_wechat_contact()
             ov.set_account_status(msg[1], msg[2])
-            state["account_root"] = msg[3] if len(msg) > 3 else ""
+            state["account_root"] = new_root
             state["snapshot"] = msg[4] if len(msg) > 4 else ""
             continue
         if kind == "debug":  # 调试视图的一帧；窗口不在就直接丢掉
@@ -381,6 +549,7 @@ def drain():
             continue
         if kind == "paused":  # 子进程确认已暂停
             state["confirmed"] = False
+            clear_wechat_contact()
             state["manual_context"] = None
             state["candidate_context"] = None
             ov.set_identity_candidates(None, [])
@@ -393,6 +562,7 @@ def drain():
         if kind == "dead":  # 采集彻底停了（微信关了之类），这才是真的要清状态
             state["area"] = None
             state["confirmed"] = False
+            clear_wechat_contact()
             state["manual_context"] = None
             state["candidate_context"] = None
             ov.set_identity_candidates(None, [])
@@ -418,7 +588,8 @@ def drain():
         for who, name, text in new:
             if who in ("her", "me"):
                 chat["history"].append((who, text, name))
-            ov.log_message(who, text, name, chat=title)
+            if not state["confirmed"]:
+                ov.log_message(who, text, name, chat=title)
             if who == "her" and name:  # 群里发过言的人，去重后最近的排最前
                 if name in chat["senders"]:
                     chat["senders"].remove(name)
@@ -445,7 +616,12 @@ def tick():
     try:
         follow_wechat_window()
         drain()
+        drain_wechat_contact()
+        drain_auto_prepare_result()
         poll_database_sync()
+        while not cli_profile_result.empty():
+            profile, error, show_results = cli_profile_result.get()
+            ov.set_external_profile(profile, error=error, show_results=show_results)
         while not sync_result.empty():
             root, snapshot, changed, rebased, error = sync_result.get()
             if root != state.get("account_root") or snapshot != state.get("snapshot"):
@@ -468,6 +644,8 @@ def tick():
             if rebased:
                 ov.set_status("消息分库已重同步", "success")
             chat = state["chat"]
+            if "contact/contact.db" in changed and state.get("contact_context"):
+                request_wechat_contact(*state["contact_context"], force=True)
             if any(relative.startswith("message/") for relative in changed) and chat in history_sources:
                 page = history_state.get(chat)
                 if page and page["loading"]:
@@ -490,6 +668,8 @@ def tick():
             first = not page["loaded"]
             page.update(cursor=cursor, loaded=True, more=more)
             ov.set_history_page(chat, rows, more, first_page=first)
+            if first:
+                ov.set_database_latest(chat, latest_incoming_from_rows(rows, source[1], state.get("account_root")))
             if page.get("refresh_pending"):
                 history_state.pop(chat, None)
                 on_load_history(chat)
@@ -501,6 +681,7 @@ def tick():
             elif state["hwnd"] is not None and account_for_window(state["hwnd"]) == account:
                 ov.set_status("数据库副本已就绪，正在重新识别会话", "success")
                 state["confirmed"] = False
+                clear_wechat_contact()
                 state["manual_context"] = None
                 state["area"] = None
                 state["snapshot"] = ""
@@ -556,7 +737,9 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
                  on_target_change=on_target_change, on_toggle_debug=set_debug,
                  on_prepare_db=on_prepare_db, on_load_history=on_load_history,
                  on_confirm_identity=on_confirm_identity,
+                 on_refresh_profile=refresh_cli_profile,
                  result_of=lambda t: chats.get(t, {}).get("result"))
+    refresh_cli_profile()
     child = dbg = None
     capture_on.set()
     try:

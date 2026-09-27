@@ -1,0 +1,7 @@
+{
+  "id": "chat_media",
+  "version": "0.1.0",
+  "api_version": 1,
+  "capability": "media_preview",
+  "entry": "plugin.py"
+}

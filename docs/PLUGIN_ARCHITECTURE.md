@@ -25,11 +25,14 @@
 ## 宿主与插件合同
 
 - 当前 `recognizer` 的 `plugin.json` 声明 `id`、`version`、`api_version: 1`、`capability: recognizer` 和 `entry`。入口导出 `read_window_context`（当前窗口 UIA 标题、可见消息及时间）、`read_header`（OCR 回退）、`Match` 和有 `needs_refresh`、`resolve_fast`、`resolve` 方法的 `Recognition`；`app/worker.py` 只通过加载器调用这些接口。短消息序列、OCR 放大取证、同名判断及清未读信号均由插件内部编排。
+- `session_recognition` 还提供按已确认 `username` 从当前账号明文快照查询昵称、备注和头像 URL 的 `read_contact`；头像下载仅允许微信 CDN、限制大小和超时。宿主异步读取，并用会话/快照/世代号过滤过期结果；CRM 固定客户数据不得作为微信联系人资料展示。
 - 宿主 v1 服务在 `app/plugin_api.py`：`ocr_boxes`、`classify_chat_box`、`open_snapshot`、`snapshot_stamp`、`snapshot_text`。插件不得自行连接微信原始 DB；`open_snapshot` 只面向本地已发布的明文副本。
 - 源码运行时从仓库 `plugins/` 加载；发布包从 EXE 同级 `plugins/` 加载。替换插件后重启生效，清单版本不兼容或入口缺失时采集停止并显示错误，不回退到未确认的旧会话。
 - 宿主负责插件发现、生命周期、配置、任务调度、会话身份、登录门禁、界面和 CLI 分发；插件只能通过版本化的公开合同贡献能力，不直接依赖宿主内部模块。
 - 每个 `plugins/<id>/` 目录包含清单和入口。清单至少声明稳定 ID、插件版本、兼容的宿主 API 版本、扩展类型、入口及配置模式；加载前检查 ID 冲突和版本兼容。
 - 预留四类扩展：`recognizer`（识别当前会话）、`message_source`（读取消息）、`auth_provider`（助手登录）、`command`（CLI 命令）。设置页入口由宿主提供，插件贡献配置字段和校验规则。
+- `contact_profile` 是独立的 `profile_provider` 插件：当前从同一次 `ahucli memory search` 查询中读取固定测试客户的 `ahu_crm_profile` 与 `crm_key_event`，分别显示在右侧“用户画像”和“用户记忆”Tab；`--query` 有默认值，也可在右侧选择或输入后手动查询。不与微信账号或会话绑定，不参与回复生成。宿主只负责后台调度和右侧栏显示；将来接入真实映射时，必须先确认微信联系人与 CRM 客户 ID 的对应关系，不能用昵称推断。
+- `chat_media` 是独立的 `media_preview` 插件：宿主从已发布的只读消息快照提供图片消息类型、内容及附件索引；插件只读取同账号、同联系人的本地附件缓存并将解码预览写到该账号的程序缓存。缓存缺失时只显示占位说明，不下载 XML 中的链接，不扫描进程内存，也不把图片内容送入回复模型。
 - 识别策略返回账号/窗口/会话候选、依据和状态（唯一匹配、无法确定、失败）；宿主按用户配置的插件顺序尝试，并复用同一次采集的 OCR/窗口观察结果。插件失败不得复用上一个窗口或账号的识别结果。
 - 插件列表及识别顺序由用户配置。安装、启用与升级分别管理；可选识别插件加载失败时显示原因并继续下一策略，设为必需的登录插件无法使用时不得启动受保护功能。
 - CLI 插件命令必须在 GUI 初始化前分发。将来配置为必需登录后，CLI 的受保护命令也要经过同一登录门禁。

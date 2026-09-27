@@ -1,0 +1,7 @@
+{
+  "id": "contact_profile",
+  "version": "0.2.1",
+  "api_version": 1,
+  "capability": "profile_provider",
+  "entry": "plugin.py"
+}

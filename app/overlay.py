@@ -7,15 +7,15 @@ from datetime import datetime
 from math import isfinite
 from types import SimpleNamespace
 
-from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPixmap
+from PySide6.QtCore import QObject, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QImageReader, QPainter, QPainterPath, QPixmap, QTextCursor, QTextDocument, QTextImageFormat
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QSizeGrip, QSizePolicy,
-    QStackedWidget, QVBoxLayout, QWidget,
+    QStackedWidget, QTabBar, QTextBrowser, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
     BodyLabel, CardWidget, CheckBox, ComboBox, EditableComboBox, FluentIcon as FIF,
-    HyperlinkButton, IndeterminateProgressBar, LineEdit, PasswordLineEdit, PlainTextEdit,
+    HyperlinkButton, IndeterminateProgressBar, LineEdit, PasswordLineEdit,
     PrimaryPushButton, PushButton, ScrollArea, SpinBox, SwitchButton, Theme, TransparentToolButton,
     setCustomStyleSheet, setFont, setTheme, setThemeColor,
 )
@@ -25,9 +25,13 @@ from app.version import VERSION
 from core import jev_client, llm, providers
 from core.questions import CHOICE_LABELS
 
-_LOG_LINES = 300
 _MUTED = "#68776f"
 _GREEN = "#18794e"
+_PROFILE_QUERIES = (
+    "客户关注哪些课程？",
+    "客户最近有哪些关键事件？",
+    "当前有哪些跟进建议？",
+)
 _RELATIONSHIPS = [
     ("恋人", "romantic partners"), ("朋友", "friends"), ("同事", "colleagues"),
     ("家人", "family"), ("自定义", None),
@@ -128,6 +132,24 @@ def _tool(icon, title, callback, parent=None):
     return button
 
 
+def _round_avatar(data, size=48):
+    source = QPixmap()
+    if not data or not source.loadFromData(data):
+        return None
+    target = QPixmap(size, size)
+    target.fill(Qt.transparent)
+    painter = QPainter(target)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform)
+    clip = QPainterPath()
+    clip.addEllipse(0, 0, size, size)
+    painter.setClipPath(clip)
+    scaled = source.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    painter.drawPixmap((size - scaled.width()) // 2, (size - scaled.height()) // 2, scaled)
+    painter.end()
+    return target
+
+
 class _Surface(CardWidget):
     def __init__(self, parent=None, accent=False):
         self.accent = accent
@@ -222,7 +244,7 @@ class _ReplyCard(_Surface):
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
                  on_toggle_debug=None, on_prepare_db=None, on_load_history=None,
-                 on_confirm_identity=None):
+                 on_confirm_identity=None, on_refresh_profile=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。"""
@@ -236,6 +258,8 @@ class Overlay:
         self.on_prepare_db = on_prepare_db
         self.on_load_history = on_load_history
         self.on_confirm_identity = on_confirm_identity
+        self.on_refresh_profile = on_refresh_profile
+        self._external_profile = None
         self._identity_candidates = []
         self._identity_context = None
         self.result_of = result_of
@@ -246,10 +270,8 @@ class Overlay:
         self._compact = None  # 断点模式：None 保证 _relayout 第一次调用必定生效
         self._pageLayouts = []
         self._hintLabels = []
-        self.feeds = {}  # {会话名: [排好版的记录]}
         self.db_history = {}
         self.history_more = {}
-        self.counts = {}  # {会话名: 消息条数}
         self.hers = {}  # {会话名: 对方最近一句}
         self.targets = {}  # {会话名: ([发言人], 当前回复对象)}
         self._account_name = ""
@@ -264,8 +286,8 @@ class Overlay:
         self.win.setStyleSheet(
             "QWidget#assistantWindow { background: #f5f7f6; border: 1px solid #dce3de; border-radius: 14px; }"
         )
-        self.win.setMinimumWidth(320)
-        self.win.setMaximumWidth(640)
+        self.win.setMinimumWidth(680)
+        self.win.setMaximumWidth(1200)
         outer = QVBoxLayout(self.win)
         outer.setContentsMargins(1, 1, 1, 1)
         outer.setSpacing(0)
@@ -311,8 +333,15 @@ class Overlay:
         self.updateBar.setFixedHeight(32)
         self.updateBar.hide()
         outer.addWidget(self.updateBar)
-        self.pages = QStackedWidget(self.win)
-        outer.addWidget(self.pages, 1)
+        content = QWidget(self.win)
+        columns = QHBoxLayout(content)
+        columns.setContentsMargins(0, 0, 0, 0)
+        columns.setSpacing(0)
+        self.pages = QStackedWidget(content)
+        columns.addWidget(self.pages, 1)
+        self._build_profile_panel(content)
+        columns.addWidget(self.profilePanel)
+        outer.addWidget(content, 1)
         self._build_home()
         self._build_settings()
         footer = QHBoxLayout()
@@ -324,12 +353,275 @@ class Overlay:
         outer.addLayout(footer)
         screen = self.app.primaryScreen().availableGeometry()
         self.win.setMinimumHeight(min(360, screen.height() - 32))
-        self.win.resize(min(440, screen.width() - 32), min(820, screen.height() - 48))
+        self.win.setMinimumWidth(min(680, screen.width() - 32))
+        self.win.resize(min(850, screen.width() - 32), min(820, screen.height() - 48))
         self.win.move(screen.right() - self.win.width() - 20, screen.top() + 24)
         self._relayout(self.win.width(), self.win.height())  # resizeEvent 补不到构造时这一次
         self.set_status("等待新消息" if settings.has_key() else "需要配置模型",
                         "idle" if settings.has_key() else "warning")
         self.win.show()
+
+    def _build_profile_panel(self, parent):
+        self.profilePanel = QWidget(parent)
+        self.profilePanel.setObjectName("profilePanel")
+        self.profilePanel.setFixedWidth(350)
+        self.profilePanel.setStyleSheet(
+            "QWidget#profilePanel { background: #ffffff; border-left: 1px solid #dce3de; }"
+        )
+        panel = QVBoxLayout(self.profilePanel)
+        panel.setContentsMargins(0, 0, 0, 0)
+        panel.setSpacing(0)
+        header_widget = QWidget(self.profilePanel)
+        heading = QVBoxLayout(header_widget)
+        heading.setContentsMargins(22, 20, 22, 10)
+        heading.setSpacing(7)
+        header = QHBoxLayout()
+        header.addWidget(_label("客户信息", 20, "#24382d", True), 1)
+        heading.addLayout(header)
+        heading.addWidget(_label("固定客户 ID · 未关联当前微信会话", 11, "#a15e1a"))
+        query_label = _label("查询问题", 12, _MUTED)
+        heading.addWidget(query_label)
+        self.profileQueryBox = EditableComboBox(self.profilePanel)
+        self.profileQueryBox.setMinimumWidth(0)
+        self.profileQueryBox.setFixedHeight(34)
+        self.profileQueryBox.setAccessibleName("客户信息查询问题")
+        self.profileQueryBox.addItems(list(_PROFILE_QUERIES))
+        self.profileQueryBox.setText(_PROFILE_QUERIES[0])
+        self.profileQueryBox.returnPressed.connect(self._refresh_external_profile)
+        query_label.setBuddy(self.profileQueryBox)
+        query_row = QHBoxLayout()
+        query_row.setSpacing(6)
+        query_row.addWidget(self.profileQueryBox, 1)
+        self.profileRefreshButton = _tool(FIF.SEARCH, "查询当前问题", self._refresh_external_profile)
+        query_row.addWidget(self.profileRefreshButton)
+        heading.addLayout(query_row)
+        self.profileStatus = _label("准备读取", 11, _MUTED)
+        heading.addWidget(self.profileStatus)
+        self.profileQueryBox.textChanged.connect(self._profile_query_changed)
+        self.wechatContact = QWidget(header_widget)
+        contact_row = QHBoxLayout(self.wechatContact)
+        contact_row.setContentsMargins(0, 0, 0, 0)
+        contact_row.setSpacing(12)
+        self.wechatAvatar = QLabel()
+        self.wechatAvatar.setFixedSize(48, 48)
+        self.wechatAvatar.setAlignment(Qt.AlignCenter)
+        self.wechatAvatar.setStyleSheet("background: #e8eeea; border-radius: 24px;")
+        contact_row.addWidget(self.wechatAvatar, 0, Qt.AlignTop)
+        details = QVBoxLayout()
+        details.setContentsMargins(0, 0, 0, 0)
+        details.setSpacing(3)
+        self.wechatNickname = _label("当前微信会话未确认", 15, "#24382d", True)
+        self.wechatRemark = _label("", 12, _MUTED)
+        self.wechatId = _label("", 11, _MUTED)
+        details.addWidget(self.wechatNickname)
+        details.addWidget(self.wechatRemark)
+        details.addWidget(self.wechatId)
+        contact_row.addLayout(details, 1)
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setStyleSheet("color: #e8eeea;")
+        heading.addSpacing(5)
+        heading.addWidget(separator)
+        heading.addWidget(self.wechatContact)
+        self.set_wechat_contact()
+        panel.addWidget(header_widget)
+        self.profileTabs = QTabBar(self.profilePanel)
+        self.profileTabs.setExpanding(True)
+        self.profileTabs.addTab("用户画像")
+        self.profileTabs.addTab("用户记忆")
+        self.profileTabs.setAccessibleName("客户信息视图")
+        self.profileTabs.setStyleSheet(
+            "QTabBar::tab { background: #ffffff; color: #68776f; border: none; "
+            "border-bottom: 2px solid #e8eeea; padding: 10px 12px; } "
+            "QTabBar::tab:selected { color: #18794e; border-bottom: 2px solid #18794e; }"
+        )
+        panel.addWidget(self.profileTabs)
+        self.profileViews = QStackedWidget(self.profilePanel)
+        self.profileTabs.currentChanged.connect(self.profileViews.setCurrentIndex)
+        panel.addWidget(self.profileViews, 1)
+        scroll = ScrollArea(self.profileViews)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.viewport().setAutoFillBackground(False)
+        content = QWidget()
+        content.setStyleSheet("background: #ffffff;")
+        body = QVBoxLayout(content)
+        body.setContentsMargins(22, 16, 22, 24)
+        body.setSpacing(12)
+        body.addWidget(_label("CRM 画像 · 固定客户 ID", 11, _MUTED, True))
+        self.profileContent = QWidget()
+        fields = QVBoxLayout(self.profileContent)
+        fields.setContentsMargins(0, 4, 0, 0)
+        fields.setSpacing(16)
+        self.profileName = _label("", 17, "#24382d", True)
+        self.profileName.hide()
+        fields.addWidget(self.profileName)
+        self.profileGrade = _label("", 13, _GREEN, True)
+        fields.addWidget(self.profileGrade)
+
+        def section(title):
+            wrapper = QWidget()
+            layout = QVBoxLayout(wrapper)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(5)
+            divider = QFrame()
+            divider.setFrameShape(QFrame.HLine)
+            divider.setStyleSheet("color: #e8eeea;")
+            layout.addWidget(divider)
+            layout.addWidget(_label(title, 11, _MUTED, True))
+            value = _label("", 13, "#30443a")
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            layout.addWidget(value)
+            fields.addWidget(wrapper)
+            return wrapper, value
+
+        self.profileSections = {
+            name: section(title) for name, title in (
+                ("summary", "沟通摘要"), ("study", "学习情况"),
+                ("suggestions", "跟进建议"), ("emotion", "近期情绪"),
+                ("stages", "SOP 阶段"), ("policy", "联系状态"),
+                ("reason", "分级依据"), ("evidence", "资料依据"))
+        }
+        self.profileContent.hide()
+        body.addWidget(self.profileContent)
+        self.profileEmpty = _label("暂无用户画像", 13, _MUTED)
+        self.profileEmpty.hide()
+        body.addWidget(self.profileEmpty)
+        body.addStretch(1)
+        scroll.setWidget(content)
+        self.profileViews.addWidget(scroll)
+
+        memory_scroll = ScrollArea(self.profileViews)
+        memory_scroll.setWidgetResizable(True)
+        memory_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        memory_scroll.setFrameShape(QFrame.NoFrame)
+        memory_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        memory_scroll.viewport().setAutoFillBackground(False)
+        memory_content = QWidget()
+        memory_content.setStyleSheet("background: #ffffff;")
+        memory_body = QVBoxLayout(memory_content)
+        memory_body.setContentsMargins(22, 16, 22, 24)
+        memory_body.setSpacing(10)
+        self.memoryQuery = _label("", 12, _MUTED)
+        self.memoryQuery.hide()
+        memory_body.addWidget(self.memoryQuery)
+        self.memoryEmpty = _label("暂无用户记忆", 13, _MUTED)
+        memory_body.addWidget(self.memoryEmpty)
+        self.memoryList = QVBoxLayout()
+        self.memoryList.setSpacing(0)
+        memory_body.addLayout(self.memoryList)
+        memory_body.addStretch(1)
+        memory_scroll.setWidget(memory_content)
+        self.profileViews.addWidget(memory_scroll)
+
+    def _refresh_external_profile(self):
+        if self.on_refresh_profile:
+            self.on_refresh_profile(True)
+
+    def profile_query(self):
+        return self.profileQueryBox.text().strip()
+
+    def _profile_query_changed(self):
+        if self._external_profile is not None:
+            self.profileStatus.setText("问题已修改，点击查询更新结果")
+
+    def set_wechat_contact(self, info=None, avatar=b"", status=""):
+        self.wechatNickname.setText((info.get("nickname") or "昵称未提供") if info else
+                                    status or "当前微信会话未确认")
+        self.wechatRemark.setText("备注：" + (info.get("remark") or "未设置") if info else "")
+        self.wechatRemark.setVisible(bool(info))
+        username = info.get("username", "") if info else ""
+        shown = self.wechatId.fontMetrics().elidedText("微信 ID：" + username, Qt.ElideMiddle, 230)
+        self.wechatId.setText(shown if username else "")
+        self.wechatId.setToolTip(username)
+        self.wechatId.setVisible(bool(username))
+        self.wechatAvatar.setPixmap(_round_avatar(avatar) or FIF.PEOPLE.icon().pixmap(24, 24))
+
+    def set_external_profile(self, profile=None, error="", loading=False, show_results=False):
+        if profile is not None:
+            self._external_profile = profile
+        data = self._external_profile
+        self.profileRefreshButton.setEnabled(not loading)
+        self.profileQueryBox.setEnabled(not loading)
+        result_query = (data.get("query") or "") if data else ""
+        self.profileStatus.setText("正在查询…" if loading else
+                                   (f"查询失败：{error}；显示上次结果" if error and data else
+                                    error or (f"查询完成 · {len(data.get('memories') or [])} 条记忆"
+                                              if result_query else "来自 ahucli")))
+        has_profile = bool(data and data.get("has_profile", True))
+        self.profileContent.setVisible(has_profile)
+        self.profileEmpty.setVisible(data is not None and not has_profile)
+        if data is None:
+            self.memoryEmpty.setText("正在读取…" if loading else error or "暂无用户记忆")
+            self.memoryEmpty.show()
+            return
+        name = data.get("name") or ""
+        self.profileName.setText(name)
+        self.profileName.setVisible(bool(name) and has_profile)
+        self.profileGrade.setText(data.get("grade") or "暂无分级")
+        suggestions = [f"{item['action']}" + (f"（{item['kind']}）" if item.get("kind") else "")
+                       for item in data.get("suggestions", [])]
+        policy = data.get("contact_policy") or {}
+        values = {
+            "summary": data.get("summary", ""),
+            "study": data.get("study", ""),
+            "suggestions": "\n".join(suggestions),
+            "emotion": "；".join(data.get("emotions", [])),
+            "stages": "  ·  ".join(f"{item['stage']}：{item['status']}" for item in data.get("stages", [])),
+            "policy": " · ".join(filter(None, (policy.get("status", ""), policy.get("reason", "")))),
+            "reason": data.get("grade_reason", ""),
+            "evidence": "\n".join(f"“{quote}”" for quote in data.get("evidence", [])),
+        }
+        for name, (wrapper, label) in self.profileSections.items():
+            value = values.get(name) or ""
+            label.setText(value)
+            wrapper.setVisible(bool(value))
+        memories = data.get("memories") or []
+        self.profileTabs.setTabText(1, f"用户记忆 · {len(memories)}" if memories else "用户记忆")
+        shown_query = result_query[:80] + ("…" if len(result_query) > 80 else "")
+        self.memoryQuery.setText("本次查询：" + shown_query if result_query else "")
+        self.memoryQuery.setToolTip(result_query or "")
+        self.memoryQuery.setVisible(bool(result_query))
+        self._render_memories(memories)
+        if show_results and profile is not None:
+            self.profileTabs.setCurrentIndex(1)
+
+    def _render_memories(self, memories):
+        while self.memoryList.count():
+            item = self.memoryList.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.memoryEmpty.setText("没有可展示的记忆" if self.memoryQuery.text() else "暂无用户记忆")
+        self.memoryEmpty.setVisible(not memories)
+        for memory in memories:
+            row = QWidget()
+            layout = QVBoxLayout(row)
+            layout.setContentsMargins(0, 0, 0, 16)
+            layout.setSpacing(6)
+            heading = QHBoxLayout()
+            heading.addWidget(_label(memory.get("title") or "客户记忆", 14, "#24382d", True), 1)
+            when = memory.get("time") or ""
+            if when:
+                heading.addWidget(_label(when, 11, _MUTED))
+            layout.addLayout(heading)
+            role = memory.get("role") or ""
+            if role:
+                layout.addWidget(_label(role, 11, _MUTED))
+            detail = _label(memory.get("detail") or "", 13, "#30443a")
+            detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            layout.addWidget(detail)
+            evidence = memory.get("evidence") or []
+            if evidence:
+                proof = _label("依据：" + "；".join(evidence), 11, _MUTED)
+                proof.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                layout.addWidget(proof)
+            divider = QFrame()
+            divider.setFrameShape(QFrame.HLine)
+            divider.setStyleSheet("color: #e8eeea;")
+            layout.addWidget(divider)
+            self.memoryList.addWidget(row)
 
     def _scroll_page(self):
         scroll = ScrollArea()
@@ -351,7 +643,7 @@ class Overlay:
 
     def _relayout(self, w, h):
         """宽度跨过断点才重新摆布局（省事）；高度每次都重算，反正只是设个定高。"""
-        compact = w < 400
+        compact = self.pages.width() < 400
         if compact != self._compact:
             self._compact = compact
             self._apply_compact(compact)
@@ -483,10 +775,12 @@ class Overlay:
         self.historyButton.clicked.connect(self._toggle_history)
         self.historyButton.setAccessibleName("展开或收起聊天记录")
         body.addWidget(self.historyButton)
-        self.feed = PlainTextEdit()
+        self.feed = QTextBrowser()
         self.feed.setReadOnly(True)
-        self.feed.setPlaceholderText("识别到的聊天内容会显示在这里")
-        self.feed.setMaximumBlockCount(0)
+        self.feed.setOpenLinks(False)
+        self.feed.anchorClicked.connect(self._open_history_image)
+        self.feed.setPlaceholderText("暂无数据库聊天记录")
+        self.feed.document().setMaximumBlockCount(0)
         self.feed.setFixedHeight(160)
         self.feed.hide()
         body.addWidget(self.feed)
@@ -1037,26 +1331,30 @@ class Overlay:
         self.feed.setVisible(self.feed.isHidden())
         self.loadMoreButton.setVisible(self.feed.isVisible() and self.history_more.get(self._shown, False))
         self._history_title()
+        if self.feed.isVisible() and self._shown and self.on_load_history:
+            self.on_load_history(self._shown, refresh=True)
 
     def _history_title(self):
         action = "展开" if self.feed.isHidden() else "收起"
-        count = len(self.db_history.get(self._shown, [])) + len(self.feeds.get(self._shown, []))
+        count = len(self.db_history.get(self._shown, []))
         self.historyButton.setText(f"{action}聊天记录" + (f" · {count}" if count else ""))
 
     def set_history_page(self, chat, rows, more, first_page=False):
         if first_page and not rows:
+            self.db_history[chat] = []
             self.history_more[chat] = False
+            if chat == self._shown:
+                self._render_feed(chat)
             return
         formatted = []
-        for timestamp, _shard, _rowid, sender, content in rows:
+        for timestamp, _shard, _rowid, sender, content, image_path in rows:
             try:
                 when = datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")
             except (OverflowError, OSError, ValueError):
                 when = "时间未知"
-            formatted.append(f"{when}  {sender or '消息'}\n{content}\n")
+            formatted.append((f"{when}  {sender or '消息'}\n{content}\n", image_path))
         if first_page:
             self.db_history[chat] = formatted
-            self.feeds[chat] = []
         else:
             self.db_history[chat] = formatted + self.db_history.get(chat, [])
         self.history_more[chat] = more
@@ -1071,36 +1369,64 @@ class Overlay:
 
     def _render_feed(self, chat):
         self.feed.clear()
-        for line in self.db_history.get(chat, []) + self.feeds.get(chat, []):
-            self.feed.appendPlainText(line)
+        for text, image_path in self.db_history.get(chat, []):
+            self._append_feed_line(text, image_path)
         self.loadMoreButton.setVisible(self.feed.isVisible() and self.history_more.get(chat, False))
         self._history_title()
 
+    def _append_feed_line(self, text, image_path=""):
+        cursor = self.feed.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(text)
+        if image_path:
+            reader = QImageReader(image_path)
+            size = reader.size()
+            if size.isValid():
+                scale = min(1.0, 280 / size.width(), 200 / size.height())
+                reader.setScaledSize(QSize(max(1, round(size.width() * scale)),
+                                           max(1, round(size.height() * scale))))
+                image = reader.read()
+                if not image.isNull():
+                    url = QUrl.fromLocalFile(image_path)
+                    self.feed.document().addResource(QTextDocument.ImageResource, url, image)
+                    image_format = QTextImageFormat()
+                    image_format.setName(url.toString())
+                    image_format.setWidth(image.width())
+                    image_format.setHeight(image.height())
+                    image_format.setAnchor(True)
+                    image_format.setAnchorHref(url.toString())
+                    cursor.insertImage(image_format)
+                    cursor.insertText("\n")
+        cursor.insertText("\n")
+        self.feed.setTextCursor(cursor)
+
+    def _open_history_image(self, url):
+        if url.isLocalFile():
+            QDesktopServices.openUrl(url)
+
     def log(self, line):
-        """采集状态行：只进正在看的那个会话，不按会话存。"""
-        bar = self.feed.verticalScrollBar()
-        follow = self.feed.isHidden() or bar.value() >= bar.maximum() - 4
-        self.feed.appendPlainText(line)
-        if follow:
-            bar.setValue(bar.maximum())
+        """Keep diagnostics available on the status tooltip, outside DB history."""
+        self.status.setToolTip(str(line)[:1000])
 
     def log_message(self, who, text, name="", timestamp=None, chat=None):
-        """按会话存一份；只有正在看的那个会往显示区里写。"""
+        """Update live OCR context without mixing it into DB history."""
         chat = chat or self._shown
-        speaker = (name or "对方") if who == "her" else ("图片" if who == "image" else "我")
-        timestamp = timestamp or datetime.now().strftime("%H:%M")
-        self.counts[chat] = self.counts.get(chat, 0) + 1
-        lines = self.feeds.setdefault(chat, [])
-        lines.append(f"{timestamp}  {speaker}\n{text}\n")
-        del lines[:-_LOG_LINES]
         if who == "her":
             self.hers[chat] = text
-        if chat != self._shown:
-            return
-        self.log(lines[-1])
-        if who == "her":
+        if chat == self._shown and who == "her":
             self._show_latest(text)
-        self._history_title()
+
+    def set_database_latest(self, chat, text):
+        if text:
+            self.hers[chat] = text
+        else:
+            self.hers.pop(chat, None)
+        if chat == self._shown:
+            if text:
+                self._show_latest(text)
+            else:
+                self.latest.clear()
+                self.context.hide()
 
     def _show_latest(self, text):
         self.latest.setText(text if len(text) <= 120 else text[:120] + "…")

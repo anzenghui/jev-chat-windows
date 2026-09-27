@@ -43,6 +43,10 @@ jobs:
           Copy-Item -Path LICENSE, NOTICE -Destination 'dist\jev-chat-windows'
           New-Item -ItemType Directory -Path 'dist\jev-chat-windows\plugins\session_recognition' -Force | Out-Null
           Copy-Item -Path 'plugins\session_recognition\plugin.py', 'plugins\session_recognition\plugin.json' -Destination 'dist\jev-chat-windows\plugins\session_recognition'
+          New-Item -ItemType Directory -Path 'dist\jev-chat-windows\plugins\contact_profile' -Force | Out-Null
+          Copy-Item -Path 'plugins\contact_profile\plugin.py', 'plugins\contact_profile\plugin.json' -Destination 'dist\jev-chat-windows\plugins\contact_profile'
+          New-Item -ItemType Directory -Path 'dist\jev-chat-windows\plugins\chat_media' -Force | Out-Null
+          Copy-Item -Path 'plugins\chat_media\plugin.py', 'plugins\chat_media\plugin.json' -Destination 'dist\jev-chat-windows\plugins\chat_media'
           Compress-Archive -Path 'dist\jev-chat-windows' -DestinationPath $zip
           Add-Content -Path $env:GITHUB_OUTPUT -Value "zip=$zip"
           "{0}  {1:N1} MB" -f $zip, ((Get-Item $zip).Length / 1MB)

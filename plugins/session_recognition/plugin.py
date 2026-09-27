@@ -6,10 +6,70 @@ from pathlib import Path
 import re
 import sqlite3
 import time
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import numpy as np
 
 from app.plugin_api import classify_chat_box, ocr_boxes, open_snapshot, snapshot_stamp, snapshot_text
+
+
+def read_contact(snapshot, username):
+    """Look up one confirmed ID in its account's published contact snapshot."""
+    if not snapshot or not username:
+        return None
+    with open_snapshot(Path(snapshot) / "contact" / "contact.db") as db:
+        columns = {row[1] for row in db.execute('PRAGMA table_info("contact")')}
+        if "username" not in columns:
+            return None
+        fields = [name for name in ("nick_name", "remark", "small_head_url", "big_head_url")
+                  if name in columns]
+        selected = ",".join(f'"{name}"' for name in fields)
+        row = db.execute(f'SELECT {selected or "username"} FROM contact WHERE username=? LIMIT 1',
+                         (username,)).fetchone()
+    if row is None:
+        return None
+    avatar_url = ""
+    for name in ("small_head_url", "big_head_url"):
+        if name in fields:
+            avatar_url = snapshot_text(row[name]).strip()
+            if avatar_url:
+                break
+    return {"username": username,
+            "nickname": snapshot_text(row["nick_name"]).strip()[:160] if "nick_name" in fields else "",
+            "remark": snapshot_text(row["remark"]).strip()[:240] if "remark" in fields else "",
+            "avatar_url": avatar_url[:2048]}
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
+
+
+def fetch_avatar(url):
+    """Read a bounded image from a WeChat CDN; never follow redirects or arbitrary hosts."""
+    if not isinstance(url, str) or len(url) > 2048:
+        return b""
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError:
+        return b""
+    if (parsed.scheme not in ("http", "https") or port is not None
+            or parsed.username or parsed.password
+            or not (host.endswith(".qlogo.cn") or host.endswith(".qpic.cn"))):
+        return b""
+    safe_url = urlunsplit(parsed._replace(scheme="https", fragment=""))
+    request = Request(safe_url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with build_opener(_NoRedirect).open(request, timeout=4) as response:
+            if response.status != 200 or not response.headers.get("Content-Type", "").startswith("image/"):
+                return b""
+            data = response.read(512_001)
+            return data if len(data) <= 512_000 else b""
+    except (OSError, ValueError):
+        return b""
 
 
 @dataclass(frozen=True)
